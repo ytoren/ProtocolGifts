@@ -16,7 +16,9 @@ quoting from the [U.S. Department of State website](http://www.state.gov/s/cpr/c
 
 ## Bulding the dataset
 
-We start by extracting the links for the PDF files (one per year)
+### Step 1: Extracting the links for the PDF files (one per year)
+
+I'm using the [_rvest_]() package to read and parse simple html file (thanks USDOS webmaster!). A simple analysis of the webpage shows that regular expressions are enough to extract the links into a table:
 
 ```{r extract_links, echo=TRUE, message=FALSE}
 require(tidyverse)
@@ -40,7 +42,140 @@ read_html('http://www.state.gov/s/cpr/c29447.htm') %>%
 head(link_table, 5)
 ```
 
+### Step 2: Extract the text from the PDFs
 
+Each PDF contains a multi-page table, so a text extraction effort was necessary. I tried several packages but _pdftools_ proved to be the most effective. Unfortunately I was only able to extract raw unstaructured text (other packages like _tabulizer_ or image extraction/ OCR approach did not work well) so I ended up with one row per line. I then cleaned the various page headers/footers to get only the table text.
+
+```{r parse_pdf,echo=TRUE, message=FALSE}
+# require(devtools)
+# require(rJava)
+# install_github("ropenscilabs/tabulizerjars", args = '--arch=x64')
+# install_github("ropenscilabs/tabulizer")
+# library(tabulizer)
+
+require(pdftools)
+
+page_start_pattern <- 'Federal Register / Vol'
+page_end_pattern <- '[ ]+VerDate'
+table_pattern <- '^[ ]+AGENCY:'
+redundent_pattern1 <- '^mstockstill'
+agency_pattern <- 'AGENCY: THE WHITE HOUSE.{1}EXECUTIVE OFFICE OF THE PRESIDENT'
+
+# download.file(
+#   url = link_table$pdf_link[1], 
+#   destfile = paste0(link_table$pdf_year[1], '.pdf'), 
+#   method = 'internal'
+#   )
+
+#pdf1 <- pdf_text(paste0(link_table$pdf_year[1], '.pdf'))
+## with library pdftools
+x1 <- pdf_text(paste0(link_table$pdf_year[1], ' DD.pdf')) %>%
+  strsplit(split = '\r\n') %>%
+  unlist() %>%
+  setNames('value') %>%
+  tbl_df() %>%
+  # Find the start of the page
+  mutate(
+    page = grepl(pattern = page_start_pattern, x = value),
+    page_end = grepl(pattern = page_end_pattern, x = value),
+    table_start = grepl(pattern = table_pattern , x = value)
+    ) %>%
+  mutate(
+    page = cumsum(page),
+    table_start_sub_header = lag(table_start)) %>%
+  # Number the tables in each page
+  mutate(table_number = unlist(tapply(table_start/1000, page, cumsum))) %>%
+  filter(table_number > 0) %>%
+  mutate(table_number = page + table_number) %>%
+  # name the tables (for filtering)
+  group_by(table_number) %>%
+  mutate(table_name = head(value,1)) %>%
+  ungroup() %>%
+  # we only want presidential gifts
+  filter(
+    grepl(pattern = agency_pattern, x = table_name) & 
+      !(table_start | table_start_sub_header | page_end) & 
+      !grepl(pattern = redundent_pattern1, x = value)
+    )
+head(x1)
+```
+
+Focusing on the table text, it appears that the first 50 characters of all lines are empty:
+
+```{r test_value_50,echo=TRUE, message=FALSE}
+x1$value %>% substring(first = 1, last = 50) %>% trimws() %>% nchar() %>% sum()
+```
+
+The remainder of the text is not uniform in length, but this is probably because not all the columns of the tables are filled:
+
+```{r test_value_length, echo=TRUE, message=FALSE}
+x1 %>% ggplot(aes(x = nchar(value)-50)) + geom_histogram() + theme_classic() + xlab('Text length')
+```
+
+I though ot splitting by whitespaces, but did not get uniform results:
+
+```{r test_white_spaces,echo=TRUE, message=FALSE}
+x1 %>%
+  mutate(value50 = substring(value,50)) %>%
+  mutate(value_list = strsplit(x = value50, split = '[ ]{11}')) %>%
+  mutate(value_list_length = map_dbl(value_list, length)) %>%
+  ggplot(aes(x = value_list_length)) + geom_histogram() + theme_classic() + xlab('Number of breaks')
+
+```
+
+So I try to split by fixed width values:
+
+```{r fixed_width_test, echo=TRUE, message=FALSE}
+x1 %>%
+  mutate(
+    Blank = substring(text = value, first = 1, last = 50),
+    Reciever = substring(text = value, first = 50+1 , last = 50+40),
+    Gift_details = substring(text = value, first = 50+41, last = 50+80),
+    From = substring(text = value, first = 50+81, last = 50+120),
+    Justification = substring(text = value, first = 50+121)
+  ) -> x1
+x1 %>% select(Reciever, Gift_details, From, Justification) %>% head(30)
+```
+
+Looks better!
+
+Word wrapping is prevalent throught the document causing single gift entries to be split across multiple rows, but luckly the first line of each entry is offset by 2 characters to the left. I identyfiy these rows, create __row_id__ column per page, and use it to concatenate several rows into one (not forgetting to trim white spaces first) 
+
+```{r group_by_real_row, echo=TRUE, message=FALSE}
+x1 %>%
+  mutate(row_start = substring(Reciever, 1,2) != '  ') %>%
+  mutate(row_id = cumsum(row_start)/100 + page) %>%
+  group_by(row_id) %>%
+  summarise(
+    Reciever = paste0(Reciever, collapse = ' '),
+    Gift_details = paste(Gift_details, collapse = ' '),
+    From = paste0(From, collapse = ' '),
+    Justification = paste0(Justification, collapse = ' '),
+    Year = as.numeric(link_table$pdf_year[1])
+  ) %>%
+  filter(!grepl(x = Reciever, pattern = 'Name and title')) %>%
+  select(-row_id) -> x2
+head(x2)
+```
+
+For the final cleanup, we need to corect the text a bit (multiple white spaces) and long words split by different types of commas:
+
+```{r clean_spaces_commas, echo=TRUE, message=FALSE}
+clean_pdf_text <- function (z) {gsub('- ', '', gsub('([ ]+)', ' ',trimws(z)))}
+x3 <- x2 %>% mutate(From = clean_pdf_text(From), Gift_details = clean_pdf_text(Gift_details), From = clean_pdf_text(From), Justification = clean_pdf_text(Justification))
+```
+
+So we can compare the "before":
+```{r clean_spaces_commas_before, echo=FALSE, message=FALSE} 
+print(x2$Gift_details[1])
+```
+
+and the "after":
+```{r clean_spaces_commas_after, echo=FALSE, message=FALSE} 
+print(x3$Gift_details[1])
+```
+
+### Step 3: Now do it again...
 
 Running through the different table we can aggregate data from multiple years
 
