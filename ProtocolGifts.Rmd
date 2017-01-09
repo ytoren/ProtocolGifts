@@ -71,22 +71,25 @@ link_table
 
 ### Step 2: Extract text from the PDFs
 
-Each PDF contains a multi-page table, so a text extraction effort was necessary. I tried several packages but _pdftools_ proved to be the most effective. Unfortunately I was only able to extract raw unstructured text (other packages like _tabulizer_ or image extraction/ OCR approach did not work well) so I ended up with one row per line. I then cleaned the various page headers/footers to get only the table text and selected only pages that describe presidential gifts.
+Each PDF contains a multi-page table, so a text extraction effort was necessary. I tried several packages but `pdftools` proved to be the most effective. Unfortunately I was only able to extract raw unstructured text (other packages like `tabulizer` or image extraction & OCR approach did not work well) so I ended up with one line per row. I then cleaned the various page headers/footers to get only the table text. In addition these PDFs contain multiple tables from multiple agencies, so selected only pages that describe presidential gifts. The title of the tables changes over time so I used a rather long REGEX to select the right tables (this can probably be done more elegantly).
 
 ```{r parse_pdf,echo=TRUE, message=FALSE}
+agency_select_pattern <- 
+'(PRESIDENT OF THE U.S. AND THE NATIONAL SECURITY COUNCIL|WHITE HOUSE OFFICE AND THE NATIONAL SECURITY COUNCIL|THE WHITE HOUSE.{1}EXECUTIVE OFFICE OF THE PRESIDENT|EXECUTIVE OFFICE OF THE PRESIDENT)'
+
 get_pdf_table_text = function(
   pdf_link,
   page_start_pattern = 'Federal Register / Vol',
   page_end_pattern = '[ ]+VerDate',
   table_pattern = '^[ ]+AGENCY:',
-  redundent_pattern1 = '^mstockstill',
-  agency_pattern = 'AGENCY: THE WHITE HOUSE.{1}EXECUTIVE OFFICE OF THE PRESIDENT'
+  redundent_pattern1 = '(mstockstill|tkelley on DSK[0-9]SPTVN[0-9]PROD with NOTICES[0-9]|verDate)',
+  agency_select_pattern = '.*'
   ) { 
 
   require(pdftools)
   require(tidyverse)
   
-  x <- pdf_text(pdf = link_table$pdf_link[1]) %>%
+  x <- pdf_text(pdf = pdf_link) %>%
     strsplit(split = '\r\n') %>%
     unlist() %>%
     setNames('value') %>%
@@ -111,19 +114,21 @@ get_pdf_table_text = function(
     group_by(table_number) %>%
     mutate(table_name = head(value,1)) %>%
     ungroup() %>%
-    ## we only want presidential gifts
+    ## Cealnup 1: get rid of page headers/footers and other lines
     filter(
-      grepl(pattern = agency_pattern, x = table_name) & 
         !(table_start | table_start_sub_header | page_end) & 
         !grepl(pattern = redundent_pattern1, x = value)
       ) %>%
-    ## cleanup
+    ## Cleanup 2: filter only the required types of tables
+    filter(grepl(pattern = agency_select_pattern, x = table_name)) %>%
+    ## Cleanup 3: remove spacial characters
     #mutate(table_name = trimws(gsub(pattern = '([ ]{2,}|^[::ascii::])', replacement = ' ', x = table_name))) %>%
-    select(-page_end, -table_start, -table_start_sub_header, -table_name) %>%
+    ## Cleanup 4: remove unecessary tables
+    select(-page_end, -table_start, -table_start_sub_header) %>%
     return()
 }
 
-x1 <- get_pdf_table_text(link_table$pdf_link[1])
+link_table$pdf_link[2] %>% get_pdf_table_text(agency_select_pattern = agency_select_pattern) -> x1
 x1 %>% head(5)
 ```
 
@@ -183,9 +188,9 @@ x1 %>%
     labs(title = "White Space Map", x = "Position", y = "Row")
 ```
 
-The structure of the extracted text looks relatively stable, except for a single block of text (somewhere after row 700) which seems to have "shifted" to the right (but maintaining a similar structure). Using a "fixed width" approach is therefore impossible (we should expect this to happen in other files as well), but on the other hand trying to use only white spaces will probably be tricky too: on the one hand there are too many clusters white space blocks within the text itself, and on the other hand the white space gaps between the columns are not uniform enough in size. The end result that without going into line-be-line analysis it's going to be very difficult to identify which white space block is a column separator and which block is just a result of the text extraction.
+The structure of the extracted text looks relatively stable, except for a single block of text (somewhere after row 700) which seems to have "shifted" to the right (but maintaining a similar structure). Using a "fixed width" approach is therefore impossible (we should expect this to happen in other files as well), but trying to use only white spaces will probably be tricky too: on the one hand there are too many clusters white space blocks within the text itself, and on the other hand the white space gaps between the columns are not uniform enough in size (some columns are closer together than the gapes inside the text). The end result is that without going into line-by-line analysis it's going to be very difficult to identify which white space block is a column separator and which block is just a result of the text extraction.
 
-My approach was therefore to use dynamic delimitation: the main assumption is that column headers are good indicators for the beginning of the text (not directly though, the table header text is centered and therefore does not represent the beginning of the column)
+My approach was therefore to use dynamic delimitation: the main assumption is that column headers are good indicators for the beginning of the text (not directly though, the table header text is centered and therefore does not represent the beginning of the column).
 
 ```{r column_start_position, echo=TRUE, message=FALSE}
 ## The text the markes the beginning of the column
@@ -194,10 +199,12 @@ column_patterns <- c('Name and title of person', 'Gift, date of acceptance', 'Id
 #column_row_offset <- c(1, 0, 2, 2)
 
 ## A function to use the location of the table header to split a row in the same page
-value_row_split <- function(x, y, n = 1, offset = c(0, -7, -5, -8, -5)) {
+value_row_split <- function(x, y, n = 1, offset = c(0, -7, -5, -8, -6)) {
   p <- as.numeric(strsplit(y, split = ';')[[1]][(n-1):n])
   if(n == 1) {p <- c(1,p)}
   p[is.na(p)] <- 1000000L
+  ## If there's no match returns NA
+  if(p[2] == -1) {return(NA)}
   o <- offset[n:(n+1)]
   o[is.na(o)] <- 0
   return(substring(x, first = p[1] + o[1] , last = p[2] + o[2] - 1))
@@ -219,7 +226,7 @@ split_row_text4 <- function(y, column_patterns) {
     select(-Start1, -Start2, -Start3, -Start4) %>%
     ## Use the new string to create 4 columns
     mutate(
-      Reciever = map2_chr(value, column_starts, value_row_split, n=2),
+      Receiver = map2_chr(value, column_starts, value_row_split, n=2),
       Gift_details = map2_chr(value, column_starts, value_row_split, n=3),
       From = map2_chr(value, column_starts, value_row_split, n=4),
       Justification = map2_chr(value, column_starts, value_row_split, n=5)
@@ -227,56 +234,61 @@ split_row_text4 <- function(y, column_patterns) {
     ## Cleanup: cloumns used for processing 
     select(-column_starts) %>%
     return()
-  }
+}
 
 x1 %>% split_row_text4(column_patterns = column_patterns) -> x2
 # write.table(x2, file = 'clipboard-4096', sep = '\t', row.names = FALSE)
-x2 %>% select(Reciever, Gift_details, From, Justification) %>% head(5)
+x2 %>% select(Receiver, Gift_details, From, Justification) %>% head(10)
 ```
 
-Next stage is to remove all rows containing table headers (first 7 rows of each table)
-```{r remove_table_header, echo=TRUE, message=FALSE}
-table_header_row_cleanup <- function(z, n = 7) {
+Word wrapping is prevalent throughout the document causing single gift entries to be split across multiple rows, but luckily the first line of each entry is offset by 2 characters to the left. I identity these rows, create `row_id` column per page, and use it to concatenate several rows into one (not forgetting to trim white spaces first). I also removed the table header (first 7 rows of each table) based on the beginning of the text.
+
+```{r group_by_actual_row, echo=TRUE, message=FALSE}
+## A function to group multiple rows into one by offset patterns
+group_by_actual_row <- function(z, filter_pattern = '(Name and title of person accepting|the gift on behalf of the|^[ ]*$)') {
   z %>%
-    group_by(page) %>% 
-    mutate(row_num_in_page = row_number()) %>%
-    ungroup() %>%
-    filter(row_num_in_page > n) %>%
-    select(-row_num_in_page) %>%
-    return()
-}
-x2 %>% table_header_row_cleanup -> x3 
-```
-
-Word wrapping is prevalent throughout the document causing single gift entries to be split across multiple rows, but luckily the first line of each entry is offset by 2 characters to the left. I identity these rows, create __row_id__ column per page, and use it to concatenate several rows into one (not forgetting to trim white spaces first) 
-
-```{r group_by_real_row, echo=TRUE, message=FALSE}
-group_by_actual_row <- function(y, filter_pattern = 'Name and title') {
-  y %>%
-    mutate(row_start = substring(Gift_details, 1,1) != ' ') %>%
-    mutate(row_id = cumsum(row_start)/100 + page) %>%
+    ## Identify left-idented rows from "Gift_details" and "Receiver"
+    mutate(
+      ident_Re = regexpr(pattern = '^[ ]+', text = Receiver) %>% attr('match.length'),
+      ident_GD = regexpr(pattern = '^[ ]+', text = Gift_details) %>% attr('match.length')
+    ) %>%
+    ## Create a lag / lead column for both
+    mutate(
+      ident_Re_lag  =  lag(x = ident_Re, n = 1, default = 0),
+      ident_Re_lead = lead(x = ident_Re, n = 1, default = 1e9),
+      ident_GD_lag  =  lag(x = ident_GD, n = 1, default = 0),
+      ident_GD_lead = lead(x = ident_GD, n = 1, default = 1e9)
+    ) %>% 
+    ## A line starts if the next line is offset to the left and so is the prev line
+    mutate(row_start = as.numeric(ifelse((ident_Re < ident_Re_lead & ident_Re < ident_Re_lag) | (ident_GD < ident_GD_lead & ident_GD < ident_GD_lag), 1, 0))) %>% 
+    ## Mark each lines start (per page) and collapse the lines into a single line
+    mutate(row_id = cumsum(row_start)/100 + page) %>% 
     group_by(row_id) %>%
-    filter(!grepl(x = Reciever, pattern = filter_pattern)) %>%
+    # filter(!grepl(x = Receiver, pattern = filter_pattern)) %>%
     summarise(
-      Reciever = paste(Reciever, collapse = ' '),
+      Receiver = paste(Receiver, collapse = ' '),
       Gift_details = paste(Gift_details, collapse = ' '),
       From = paste(From, collapse = ' '),
-      Justification = paste(Justification, collapse = ' ')
-      # Year = as.numeric(link_table$pdf_year[1])
+      Justification = paste(Justification, collapse = ' '),
+      control_text = paste(value, collapse = ';')
+    # Year = as.numeric(link_table$pdf_year[1])
     ) %>%
-    select(-row_id) 
-  }
+    ## Remove the first line of each table - usually contains headers
+    filter(!grepl(pattern = filter_pattern, x = Receiver)) %>% 
+    #select(-row_id) %>%
+    return()
+}
 
-x3 %>% group_by_actual_row -> x4
+x2 %>% group_by_actual_row() -> x4
 x4 %>% head(5)
 ```
 
 For the final cleanup, we need to correct the text a bit (multiple white spaces) and long words split by different types of commas:
 
 ```{r clean_spaces_commas, echo=TRUE, message=FALSE}
-clean_pdf_text <- function (z) {
-  require(tidyverse)
-  z %>%
+clean_col_text <- function (y) {
+  require(magrittr)
+  y %>%
     gsub(pattern = '[.]{2,}', replacement = '') %>%
     gsub(pattern = '([ ]+)', replacement = ' ') %>%
     gsub(pattern = '- ', replacement = '') %>% 
@@ -284,7 +296,14 @@ clean_pdf_text <- function (z) {
     return()
 }
 
-x4 %>% apply(MARGIN = 2, FUN = clean_pdf_text) %>% tbl_df() -> x5
+x4 %>% 
+  mutate(
+    row_id = as.numeric(row_id),
+    Receiver = clean_col_text(Receiver),
+    Gift_details = clean_col_text(Gift_details),
+    From = clean_col_text(From),
+    Justification = clean_col_text(Justification)
+  )-> x5
 ```
 
 So we can compare the "before":
@@ -299,7 +318,7 @@ print(x5$Gift_details[1])
 
 ### Step 4: Extract more data from the gift description column
 
-The __Gift_detail__ column seem to contain some internal structure of 4 sentences:
+The `Gift_detail` column seem to contain some internal structure of 4 sentences:
 
 1. A short description of the gift
 2. Date of receipt
@@ -307,22 +326,40 @@ The __Gift_detail__ column seem to contain some internal structure of 4 sentence
 4. Disposition
 
 ```{r gift_detail_exctract, echo=TRUE, message=FALSE} 
-gd_patterns <- c(' Rec[\u2019]d([\u2014]{0,}| )', ' E(s|)(t|)[.]{0,1} Val(u|)(e|)([\u2014]{0,}| )', ' Disposition([\u2014]{0,}| )')
+# TODO: grep dates directly: Rec'd-dd/mm/yyyy | 
+
+gd_patterns <- c(' Rec[\u2019]{0,1}d([\u2014]{0,}| )', ' E(s|)(t|)[.]{0,1} Val(u|)(e|)([\u2014]{0,}| )', ' Disposition([\u2014]{0,}| )')
 
 extract_gift_details <- function(z, patterns) { 
-  x5 %>%
-    mutate(gd_splits = map_chr(Gift_details, function(z) {map(patterns, regexpr, text = z) %>% unlist() %>% paste(collapse = ';')})) %>%
+  z %>%
+    ## Add a column containig the breakpoints. I concatenated as a string for readability
     mutate(
-        Gift = map2_chr(Gift_details, gd_splits, value_row_split, n=1, offset = NA) %>% 
-          trimws(),
-        Date = map2_chr(Gift_details, gd_splits, value_row_split, n=2, offset = NA) %>% 
-          gsub(pattern = '([^(0-9|/)])', replacement = '') %>% 
-          as.Date(format = "%m/%d/%Y"),
-        Value = map2_chr(Gift_details, gd_splits, value_row_split, n=3, offset = NA) %>% 
-          map_chr(function(z) {regmatches(z, regexpr(z, pattern = '\\d{1,3}(,\\d{3})*(\\.\\d+)?'))}) %>%
-          gsub(pattern = ',', replacement = '') %>% 
-          as.numeric(),
-        Disposition = map2_chr(Gift_details, gd_splits, value_row_split, n=4, offset = NA) %>% trimws() %>% substring(first = 13) 
+      gd_splits = map_chr(
+        Gift_details, 
+        function(z) {
+          map(patterns, regexpr, text = z) %>% 
+            unlist() %>% 
+            paste(collapse = ';') %>%
+            return()
+        }
+      )
+    ) %>%
+    ## Use the text column "gd_splits" to break down "Gift_details"
+    mutate(
+        Gift  = map2_chr(Gift_details, gd_splits, value_row_split, n=1, offset = NA),
+        Date  = map2_chr(Gift_details, gd_splits, value_row_split, n=2, offset = NA), 
+        Value = map2_chr(Gift_details, gd_splits, value_row_split, n=3, offset = NA),
+        Disposition = map2_chr(Gift_details, gd_splits, value_row_split, n=4, offset = NA)  
+    ) %>%
+    ## Clean columns (I separated steps to make the code more readable)
+    mutate(
+      Gift = trimws(Gift),
+      ## TODO: if starts with a letter use mmmm dd,yyyy, otherwise use '%m/%d/%y'
+      # Date = Date %>% gsub(pattern = '([^(0-9|/)])', replacement = '') %>% as.Date(format = "%m/%d/%Y"), 
+      # Value = Value %>% map_chr(function(y) {regmatches(y, regexpr(y, pattern = '\\d{1,3}(,\\d{3})*(\\.\\d+)?'))}) %>% gsub(pattern = ',', replacement = '') %>% as.numeric(),
+      Disposition = Disposition %>% 
+        map(function(y) {substring(y, first = regexpr(pattern = '\u2014', text = y)[1]+1)}) %>% 
+        trimws()
     ) %>%
     ## Cleanup
     select(-Gift_details, -gd_splits) %>%
@@ -335,25 +372,43 @@ x6 %>% head(5)
 
 ### Step 5: Rinse and repeat...
 
-Running through the different PDF links we can aggregate data from multiple years. The fact that we used the tidy approach makes this wonderfully readable:
+Running through the different PDF links we can aggregate data from multiple years. The one issue I found was that the table names for presidential gift has changed over the years, but the fact that we used the tidy approach makes this wonderfully readable. You can actually pipe all function to one another in a single `mutate` statement but I preferred to split the steps for debugging.
 
 ```{r gift_extract, echo=TRUE, message=FALSE} 
 link_table %>%
-  mutate(
-    text_df = pdf_link %>% 
-      map(get_pdf_table_text) %>% 
-      map(split_row_text4, column_patterns = column_patterns) %>%
-      map(table_header_row_cleanup)  %>%
-      map(group_by_actual_row) %>%
-      map(apply, MARGIN = 2, FUN = clean_pdf_text) %>% 
-      map(tbl_df) %>%
-      map(extract_gift_details, patterns = gd_patterns)
-  ) %>%
-  unnest(text_df) -> gifts
+  mutate(text_df = pdf_link %>% map(get_pdf_table_text, agency_select_pattern = agency_select_pattern)) -> gifts01
+  #saveRDS(gifts01, file = 'gifts01.RDS')
+
+gifts01 %>% 
+  mutate(text_df = text_df %>% map(split_row_text4, column_patterns = column_patterns)) %>%
+  mutate(text_df = text_df %>% map(filter, !grepl(x = value, pattern = '(^[A-Za-z]+ on [A-Z0-9]*PROD[A-Z0-9]* with (NOTICES|MISCELLANEOUS)|^VerDate)'))) %>%
+  mutate(text_df = text_df %>% map(split_row_text4, column_patterns = column_patterns)) %>%
+  ## Filter some problems on 2003 pages 31,32
+  mutate(text_df = text_df %>% map(filter, !is.na(Receiver))) %>%
+  mutate(text_df = text_df %>% map(group_by_actual_row)) %>%
+  mutate(text_df = text_df %>% map(mutate,
+    row_id = as.numeric(row_id),
+    Receiver = clean_col_text(Receiver),
+    Gift_details = clean_col_text(Gift_details),
+    From = clean_col_text(From),
+    Justification = clean_col_text(Justification)
+  )) %>%
+  mutate(text_df = text_df %>% map(extract_gift_details, patterns = gd_patterns)) %>%
+  unnest(text_df) %>% 
+  ## extract dates & values
+  mutate() %>% 
+  ## TODO: filter headers, footers, etc.
+  filter() %>%
+  clipboard(4096*4)
+
 ```
+
+## Current Issues:
+1. Last 2 pages of 2003 PDF do not parse correctly. I excluded them with the filter `is.na(Receiver)`
+2. The `Justification` column does not split correctly for about 2.5% of row (about 500 out of 20k rows in table prior to joining lines together) - This will influence the text of this column and the `From` column. 
+3. in older files the `Receiver` column is not filled for every gift (the receiver is mentioned only one time per page).
 
 ## Analysis
 
 ### Visualizations
-
 
