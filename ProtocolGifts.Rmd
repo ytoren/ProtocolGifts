@@ -52,6 +52,13 @@ require(rvest)
 
 pdf_pattern <- 'http://www[.]state[.]gov/documents/organization/[0-9]{6}[.]pdf'
 
+## Extract regex value from a string and retur
+regex_extract <- function(y, pattern, ...) {
+  res <- regmatches(y, regexpr(pattern, y, ...))
+  if(length(res) == 0) {return(NA)} else {return(res)}
+}
+
+
 ## Extract PDF links
 read_html('http://www.state.gov/s/cpr/c29447.htm') %>%
   html_node(xpath = "//table") %>%
@@ -61,8 +68,8 @@ read_html('http://www.state.gov/s/cpr/c29447.htm') %>%
   tbl_df() %>%
   ## strip down the surroundings
   mutate(
-    pdf_link = sapply(value, FUN = function(y) {regmatches(y, regexpr(pdf_pattern, y))}),
-    pdf_year = sapply(value, FUN = function(y) {gsub('(<|/|b|>|)', '', regmatches(y, regexpr('<b>[0-9]{4}</b>', y)))})
+    pdf_link = map_chr(value, regex_extract, pdf_pattern),
+    pdf_year = gsub('(<|/|b|>|)', '', map_chr(value, regex_extract, '<b>[0-9]{4}</b>'))
   ) %>% 
   select(-value) -> link_table
 
@@ -82,7 +89,7 @@ get_pdf_table_text = function(
   page_start_pattern = 'Federal Register / Vol',
   page_end_pattern = '[ ]+VerDate',
   table_pattern = '^[ ]+AGENCY:',
-  redundent_pattern1 = '(mstockstill|tkelley on DSK[0-9]SPTVN[0-9]PROD with NOTICES[0-9]|verDate)',
+  redundent_pattern1 = '(mstockstill|[A-Za-z]+ on [A-Z0-9]*PROD[A-Z0-9]* with (NOTICES|MISCELLANEOUS)|VerDate)',
   agency_select_pattern = '.*'
   ) { 
 
@@ -199,8 +206,8 @@ column_patterns <- c('Name and title of person', 'Gift, date of acceptance', 'Id
 #column_row_offset <- c(1, 0, 2, 2)
 
 ## A function to use the location of the table header to split a row in the same page
-value_row_split <- function(x, y, n = 1, offset = c(0, -7, -5, -8, -6)) {
-  p <- as.numeric(strsplit(y, split = ';')[[1]][(n-1):n])
+value_row_split <- function(x, y, n = 1, offset = c(0, -7, -5, -8, -6), split_chr  =';') {
+  p <- as.numeric(strsplit(y, split = split_chr)[[1]][(n-1):n])
   if(n == 1) {p <- c(1,p)}
   p[is.na(p)] <- 1000000L
   ## If there's no match returns NA
@@ -214,7 +221,9 @@ value_row_split <- function(x, y, n = 1, offset = c(0, -7, -5, -8, -6)) {
 split_row_text4 <- function(y, column_patterns) {
   y %>% 
     ## extract a string of column start position based on the text
-    mutate(column_starts = map_chr(value, function(z) {paste(map(column_patterns, regexpr, text = z), collapse = ';')})) %>%
+    mutate(column_starts = map(value, function(z) {map(column_patterns, regexpr, text = z)})) %>%
+    ## Convert list into a single char with ';' separators
+    mutate(column_starts = map_chr(column_starts, paste, collapse = ';')) %>%
     ## Separate into 4 columns
     separate(col = column_starts, into = paste0('Start',1:4), sep = ';', remove = TRUE, convert = TRUE) %>% 
     ## use a single locator for each page (there should be one positive number per page, the rest are -1's due to the regexp output)
@@ -326,43 +335,33 @@ The `Gift_detail` column seem to contain some internal structure of 4 sentences:
 4. Disposition
 
 ```{r gift_detail_exctract, echo=TRUE, message=FALSE} 
-# TODO: grep dates directly: Rec'd-dd/mm/yyyy | 
+gd_patterns <- c('([ ]|[.]|[.][ ]){0,1}(Re[\u2019]{0,1}c[\u2019]{0,1}d([\u2014]{0,}| )|Received[\u2014]|Rec[\u2014])', ' E(s|)(t|)[.]{0,1} Val(u|)(e|)([\u2014]{0,}| )', ' (Disposition|Location)([\u2014]{0,}| )')
 
-gd_patterns <- c(' Rec[\u2019]{0,1}d([\u2014]{0,}| )', ' E(s|)(t|)[.]{0,1} Val(u|)(e|)([\u2014]{0,}| )', ' Disposition([\u2014]{0,}| )')
+## This function makes sure that the "grep" pattern does not contain -1's and makes sense in term of order - if there's no match then the distanct between the splits is 0.
+monotone_gd <- function(y, len) {
+  for (i in length(y):1) {
+    if(y[i] == -1) {y[i] <- ifelse(i == length(y), len, y[i+1])}
+  }
+  return(y)
+}
 
 extract_gift_details <- function(z, patterns) { 
   z %>%
-    ## Add a column containig the breakpoints. I concatenated as a string for readability
-    mutate(
-      gd_splits = map_chr(
-        Gift_details, 
-        function(z) {
-          map(patterns, regexpr, text = z) %>% 
-            unlist() %>% 
-            paste(collapse = ';') %>%
-            return()
-        }
-      )
-    ) %>%
+    ## Add a column containig the breakpoints. 
+    mutate(gd_splits = Gift_details %>% map(function(z) {map(patterns, regexpr, text = z)})) %>%
+    ## make sure that gd_splits vector is monotomous (up to nchar(Gift_details))
+    mutate(gd_splits = map2(gd_splits, nchar(Gift_details), monotone_gd)) %>%
+    ## concatenate as a string for the split function
+    mutate(gd_splits = gd_splits %>% map_chr(paste, collapse = ';')) %>%
     ## Use the text column "gd_splits" to break down "Gift_details"
     mutate(
         Gift  = map2_chr(Gift_details, gd_splits, value_row_split, n=1, offset = NA),
-        Date  = map2_chr(Gift_details, gd_splits, value_row_split, n=2, offset = NA), 
+        Rec_Date  = map2_chr(Gift_details, gd_splits, value_row_split, n=2, offset = NA), 
         Value = map2_chr(Gift_details, gd_splits, value_row_split, n=3, offset = NA),
         Disposition = map2_chr(Gift_details, gd_splits, value_row_split, n=4, offset = NA)  
     ) %>%
-    ## Clean columns (I separated steps to make the code more readable)
-    mutate(
-      Gift = trimws(Gift),
-      ## TODO: if starts with a letter use mmmm dd,yyyy, otherwise use '%m/%d/%y'
-      # Date = Date %>% gsub(pattern = '([^(0-9|/)])', replacement = '') %>% as.Date(format = "%m/%d/%Y"), 
-      # Value = Value %>% map_chr(function(y) {regmatches(y, regexpr(y, pattern = '\\d{1,3}(,\\d{3})*(\\.\\d+)?'))}) %>% gsub(pattern = ',', replacement = '') %>% as.numeric(),
-      Disposition = Disposition %>% 
-        map(function(y) {substring(y, first = regexpr(pattern = '\u2014', text = y)[1]+1)}) %>% 
-        trimws()
-    ) %>%
     ## Cleanup
-    select(-Gift_details, -gd_splits) %>%
+    #select(-Gift_details, -gd_splits) %>%
     return()  
 }
 
@@ -370,18 +369,74 @@ x5 %>% extract_gift_details(patterns = gd_patterns) -> x6
 x6 %>% head(5)
 ```
 
-### Step 5: Rinse and repeat...
+### Step 5: Final clean-up
+
+1. Simple clean up of `Gift` and `Disposition`
+
+```{r gift_detail_cleanup01, echo=TRUE, message=FALSE}
+x6 %>% 
+  mutate(
+      Gift = Gift %>% trimws(),
+      Disposition = Disposition %>% map(function(y) {substring(y, first = regexpr(pattern = '\u2014', text = y)[1]+1)}) %>% trimws()
+    ) -> x6
+```
+
+2. Identify and extract multiple date patterns:
+
+```{r gift_detail_cleanup02, echo=TRUE, message=FALSE}
+short_month_patterns <- '(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)'
+long_month_patterns <- '(January|February|March|April|May|June|July|August|Sep[ ]{0,1}tember|October|November|December)'
+us_yyyy_date_pattern <- '[0-9]{1,2}[ ]{0,1}/[ ]{0,1}[0-9]{1,2}[ ]{0,1}/[ ]{0,1}20[0-9]{2}'
+us_yy_date_pattern <- '[0-9]{1,2}[ ]{0,1}/[ ]{0,1}[0-9]{1,2}[ ]{0,1}/[ ]{0,1}[0-9]{2}'
+oracle_date_pattern <- paste0('[0-9]{1,2}[ ]{0,1}(-|\u2013)[ ]{0,1}', short_month_patterns, '[ ]{0,1}(-|\u2013)[ ]{0,1}[0-9]{2}')
+long_date_pattern <- paste0(long_month_patterns,'[ ]{0,1}[0-9]{1,2}[,]{0,1}[ ]{0,1}20[0-9]{2}')
+no_day_date_pattern <- paste0(long_month_patterns,' 20[0-9]{2}')
+
+x6 %>%
+  mutate(
+    Rec_Date_US_yyyy = as.Date(gsub(' ', '', map_chr(Rec_Date, regex_extract, us_yyyy_date_pattern)), '%m/%d/%Y'),
+    Rec_Date_US_yy = as.Date(gsub(' ', '', map_chr(Rec_Date, regex_extract, us_yy_date_pattern)), '%m/%d/%y'),
+    Rec_Date_Oracle = as.Date(gsub('\u2013', '-', gsub(' ', '', map_chr(Rec_Date, regex_extract, oracle_date_pattern))), '%d-%b-%y'),
+    Rec_Date_Long = as.Date(gsub(' ', '', map_chr(Rec_Date, regex_extract, long_date_pattern)), '%B%d,%Y'),
+    Rec_Date_No_Day = as.Date(paste0('01 ', map_chr(Rec_Date, regex_extract, no_day_date_pattern)), '%d %B %Y')
+  ) %>% 
+  mutate(Gift_Rec_Date = 
+    if_else(!is.na(Rec_Date_US_yyyy), Rec_Date_US_yyyy, 
+    if_else(!is.na(Rec_Date_US_yy), Rec_Date_US_yy, 
+    if_else(!is.na(Rec_Date_Oracle), Rec_Date_Oracle, 
+    if_else(!is.na(Rec_Date_Long), Rec_Date_Long, Rec_Date_No_Day))))
+  ) -> x6
+``` 
+
+3. Identify and extract USD values of gifts:
+
+```{r gift_detail_cleanup03, echo=TRUE, message=FALSE}
+x6 %>%
+  mutate(
+    Value_tmp1 = Value %>% map_chr(regex_extract, '[$][ ]{0,1}\\d{1,3}(,\\d{3})*(\\.\\d+)?'),
+    Value_tmp2 = Rec_Date %>% map_chr(regex_extract, '[$][ ]{0,1}\\d{1,3}(,\\d{3})*(\\.\\d+)?')
+  ) %>%
+  mutate(Value_USD = gsub('[$]', '', if_else(!is.na(Value_tmp1), Value_tmp1, Value_tmp2))) -> x6
+```
+
+4. Filter rows with table headers rows of missing details in text (see list of issues below for details) and remove the "technical" columns
+
+```{r gift_detail_cleanup04, echo=TRUE, message=FALSE}
+x6 %>%
+  filter(!is.na(Gift_Rec_Date) & !is.na(Value_USD)) %>%
+  ## Cleanup of non-informative columns
+  select(-Gift_details, -control_text, -gd_splits, -starts_with('Rec_Date'), -starts_with('Value_tmp'), -Value) -> x6
+
+head(x6)
+```
+
+### Step 6: Rinse and repeat...
 
 Running through the different PDF links we can aggregate data from multiple years. The one issue I found was that the table names for presidential gift has changed over the years, but the fact that we used the tidy approach makes this wonderfully readable. You can actually pipe all function to one another in a single `mutate` statement but I preferred to split the steps for debugging.
 
-```{r gift_extract, echo=TRUE, message=FALSE} 
+```{r full_gift_extract, echo=TRUE, message=FALSE} 
 link_table %>%
-  mutate(text_df = pdf_link %>% map(get_pdf_table_text, agency_select_pattern = agency_select_pattern)) -> gifts01
-  #saveRDS(gifts01, file = 'gifts01.RDS')
-
-gifts01 %>% 
-  mutate(text_df = text_df %>% map(split_row_text4, column_patterns = column_patterns)) %>%
-  mutate(text_df = text_df %>% map(filter, !grepl(x = value, pattern = '(^[A-Za-z]+ on [A-Z0-9]*PROD[A-Z0-9]* with (NOTICES|MISCELLANEOUS)|^VerDate)'))) %>%
+  mutate(text_df = pdf_link %>% map(get_pdf_table_text, agency_select_pattern = agency_select_pattern)) %>%
   mutate(text_df = text_df %>% map(split_row_text4, column_patterns = column_patterns)) %>%
   ## Filter some problems on 2003 pages 31,32
   mutate(text_df = text_df %>% map(filter, !is.na(Receiver))) %>%
@@ -395,18 +450,48 @@ gifts01 %>%
   )) %>%
   mutate(text_df = text_df %>% map(extract_gift_details, patterns = gd_patterns)) %>%
   unnest(text_df) %>% 
-  ## extract dates & values
-  mutate() %>% 
-  ## TODO: filter headers, footers, etc.
-  filter() %>%
-  clipboard(4096*4)
+  ## simple clean-ups of Gift & Disposition
+  mutate(
+      Gift = Gift %>% trimws(),
+      Disposition = Disposition %>% map(function(y) {substring(y, first = regexpr(pattern = '\u2014', text = y)[1]+1)}) %>% trimws()
+    ) %>%
+  ## More complex clean-ups: extract dates from multiple formats
+  mutate(
+    Rec_Date_US_yyyy = as.Date(gsub(' ', '', map_chr(Rec_Date, regex_extract, us_yyyy_date_pattern)), '%m/%d/%Y'),
+    Rec_Date_US_yy = as.Date(gsub(' ', '', map_chr(Rec_Date, regex_extract, us_yy_date_pattern)), '%m/%d/%y'),
+    Rec_Date_Oracle = as.Date(gsub('\u2013', '-', gsub(' ', '', map_chr(Rec_Date, regex_extract, oracle_date_pattern))), '%d-%b-%y'),
+    Rec_Date_Long = as.Date(gsub(' ', '', map_chr(Rec_Date, regex_extract, long_date_pattern)), '%B%d,%Y'),
+    Rec_Date_No_Day = as.Date(paste0('01 ', map_chr(Rec_Date, regex_extract, no_day_date_pattern)), '%d %B %Y')
+  ) %>% 
+  mutate(Gift_Rec_Date = 
+    if_else(!is.na(Rec_Date_US_yyyy), Rec_Date_US_yyyy, 
+    if_else(!is.na(Rec_Date_US_yy), Rec_Date_US_yy, 
+    if_else(!is.na(Rec_Date_Oracle), Rec_Date_Oracle, 
+    if_else(!is.na(Rec_Date_Long), Rec_Date_Long, Rec_Date_No_Day))))
+  ) %>% 
+  ## Extract USD values
+  mutate(
+    Value_tmp1 = Value %>% map_chr(regex_extract, '[$][ ]{0,1}\\d{1,3}(,\\d{3})*(\\.\\d+)?'),
+    Value_tmp2 = Rec_Date %>% map_chr(regex_extract, '[$][ ]{0,1}\\d{1,3}(,\\d{3})*(\\.\\d+)?')
+  ) %>%
+  mutate(Value_USD = gsub('[$]', '', if_else(!is.na(Value_tmp1), Value_tmp1, Value_tmp2))) %>%
+  ## Filter remaining headers + 3 gifts with some missing details in text (see list of issues for details)
+  filter(!is.na(Gift_Rec_Date) & !is.na(Value_USD)) %>%
+  ## Cleanup of non-informative columns
+  select(-Gift_details, -control_text, -gd_splits, -starts_with('Rec_Date'), -starts_with('Value_tmp'), -Value) -> gifts
 
+write_csv(gifts, paste0('protocol_gifts_',min(gifts$pdf_year), '_', max(gifts$pdf_year),'.csv'))
 ```
 
 ## Current Issues:
-1. Last 2 pages of 2003 PDF do not parse correctly. I excluded them with the filter `is.na(Receiver)`
-2. The `Justification` column does not split correctly for about 2.5% of row (about 500 out of 20k rows in table prior to joining lines together) - This will influence the text of this column and the `From` column. 
-3. in older files the `Receiver` column is not filled for every gift (the receiver is mentioned only one time per page).
+
+2. The `Justification` column does not split correctly for about 2.5% of row (about 500 out of 20k rows in table prior to joining lines together). This will influence the text of this column and the `From` column, and also means that text quality does not allow analysis.
+3. In older files, the `Receiver` column is not filled for every gift (the receiver is mentioned only one time per page). This caused some gifts to be bundeled together (I exctracted details only for the first gift). You can explore these cases by looking at columns with a very long `Gift` or `Gift_detail` column.
+4. Exclusions:
+  1. Last 2 pages of 2003 PDF do not parse correctly. I excluded them with the filter `is.na(Receiver)`.
+  2. Problematic dates: 8 gifts were excluded from the analysis because their dates did not follow any logical pattern (e.g 19/2-4/2005). You can remove/invert the `filter(!is.na(Gift_Rec_Date))` and look through the values to find them (other lines would be table headers).
+  3. No Value: 1 gift ("round table made of hardened lava") from 17/01/2003 did not have an evaluation.
+  
 
 ## Analysis
 
