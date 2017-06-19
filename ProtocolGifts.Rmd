@@ -64,7 +64,7 @@ read_html('http://www.state.gov/s/cpr/c29447.htm') %>%
   html_node(xpath = "//table") %>%
   html_nodes(xpath = '//a') %>%
   ## grab only links to PDF files for which the label is a year
-  grep(pattern = '[.]pdf\">\n  <b>20[0-9]{2}</b>', value=TRUE) %>%
+  grep(pattern = '[.]pdf\"><b>20[0-9]{2}</b>', value=TRUE) %>%
   tbl_df() %>%
   ## strip down the surroundings
   mutate(
@@ -437,6 +437,7 @@ Running through the different PDF links we can aggregate data from multiple year
 ```{r full_gift_extract, echo=TRUE, message=FALSE} 
 link_table %>%
   mutate(text_df = pdf_link %>% map(get_pdf_table_text, agency_select_pattern = agency_select_pattern)) %>%
+  ## for testing only: readRDS('gifts01.RDS') %>%
   mutate(text_df = text_df %>% map(split_row_text4, column_patterns = column_patterns)) %>%
   ## Filter some problems on 2003 pages 31,32
   mutate(text_df = text_df %>% map(filter, !is.na(Receiver))) %>%
@@ -492,8 +493,3 @@ write_csv(gifts, paste0('protocol_gifts_',min(gifts$pdf_year), '_', max(gifts$pd
   2. Problematic dates: 8 gifts were excluded from the analysis because their dates did not follow any logical pattern (e.g 19/2-4/2005). You can remove/invert the `filter(!is.na(Gift_Rec_Date))` and look through the values to find them (other lines would be table headers).
   3. No Value: 1 gift ("round table made of hardened lava") from 17/01/2003 did not have an evaluation.
   
-
-## Analysis
-
-### Visualizations
-
